@@ -2,6 +2,8 @@ from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 import time
 import sys
+import cv2
+import threading
 
 # adjust ports and motor ids to match your setup
 LEADER_PORT = "/dev/tty.usbmodem5AE60530061"
@@ -89,6 +91,53 @@ except Exception as e:
     print(f"✗ Error: Could not load follower calibration: {e}")
     sys.exit(1)
 
+# Camera configuration
+CAMERA_INDEX = 1
+stop_camera = threading.Event()
+camera_thread = None
+latest_frame = None
+frame_lock = threading.Lock()
+
+
+def camera_capture_loop(camera_index, stop_event):
+    """Capture frames in a background thread (display must happen on main thread on macOS)."""
+    global latest_frame
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print("⚠ Warning: Could not open camera in thread.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if ret:
+            with frame_lock:
+                latest_frame = frame
+
+    cap.release()
+
+
+# Initialize camera
+print("\nInitializing camera...")
+cap_test = cv2.VideoCapture(CAMERA_INDEX)
+camera_connected = cap_test.isOpened()
+if camera_connected:
+    actual_width = int(cap_test.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap_test.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap_test.release()
+    print(f"✓ Camera detected ({actual_width}x{actual_height})")
+    # Start camera capture thread (display happens on main thread)
+    camera_thread = threading.Thread(
+        target=camera_capture_loop, args=(CAMERA_INDEX, stop_camera), daemon=True
+    )
+    camera_thread.start()
+    print("✓ Camera capture thread started")
+else:
+    cap_test.release()
+    print("⚠ Warning: Could not open camera. Continuing without video feed.")
+
 # Initialization phase: gradually move follower to leader position
 print("\n" + "=" * 70)
 print("Initialization Phase")
@@ -131,27 +180,31 @@ while not all_close and (time.time() - init_start) < INIT_TIMEOUT:
 
     for i in MOTOR_IDS:
         # Read current actual position of follower
-        follower_actual_pos = follower.read("Present_Position", f"follower_{i}", normalize=True)
-        
+        follower_actual_pos = follower.read(
+            "Present_Position", f"follower_{i}", normalize=True
+        )
+
         # Read current leader position (it may be moving, so read it fresh each time)
-        leader_target_pos = leader.read("Present_Position", f"leader_{i}", normalize=True)
-        
+        leader_target_pos = leader.read(
+            "Present_Position", f"leader_{i}", normalize=True
+        )
+
         # Get our current target position (what we're commanding)
         current_target = follower_current_targets[i]
-        
+
         # Calculate error from actual position to leader position
         error = abs(leader_target_pos - follower_actual_pos)
         max_error = max(max_error, error)
 
         if error > INIT_POSITION_TOLERANCE:
             all_close = False
-            
+
             # Calculate how much we can move this step (speed limit)
             max_step = INIT_MAX_SPEED * dt
-            
+
             # Calculate distance from current target to leader target
             distance_to_leader = leader_target_pos - current_target
-            
+
             # Move our target toward the leader, but cap the step size
             if abs(distance_to_leader) > max_step:
                 # Move by max_step toward leader
@@ -160,14 +213,16 @@ while not all_close and (time.time() - init_start) < INIT_TIMEOUT:
             else:
                 # Close enough, move target directly to leader
                 new_target = leader_target_pos
-            
+
             # Update our target and command the motor
             follower_current_targets[i] = new_target
             follower.write("Goal_Position", f"follower_{i}", new_target, normalize=True)
         else:
             # Already close enough, keep target at leader position
             follower_current_targets[i] = leader_target_pos
-            follower.write("Goal_Position", f"follower_{i}", leader_target_pos, normalize=True)
+            follower.write(
+                "Goal_Position", f"follower_{i}", leader_target_pos, normalize=True
+            )
 
     # Print progress every 0.5 seconds
     if elapsed - last_print_time >= 0.5:
@@ -197,11 +252,22 @@ print("Press Ctrl+C to stop")
 print()
 
 try:
-    while True:
+    while not stop_camera.is_set():
         # read all leader positions and write to corresponding follower motors
         for i in MOTOR_IDS:
             leader_pos = leader.read("Present_Position", f"leader_{i}", normalize=True)
             follower.write("Goal_Position", f"follower_{i}", leader_pos, normalize=True)
+
+        # Display camera frame on main thread (required for macOS)
+        if camera_connected:
+            with frame_lock:
+                frame = latest_frame
+            if frame is not None:
+                cv2.imshow("Robot Camera", frame)
+            # waitKey must be called to update window; check for 'q' to quit
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("\n'q' pressed, stopping...")
+                break
 
         time.sleep(0.02)  # 50hz
 except KeyboardInterrupt:
@@ -210,6 +276,12 @@ except Exception as e:
     print(f"\n✗ Error during operation: {e}")
 finally:
     print("Disabling torque and disconnecting...")
+    # Stop camera thread
+    stop_camera.set()
+    if camera_thread is not None and camera_thread.is_alive():
+        camera_thread.join(timeout=1.0)
+    if camera_connected:
+        cv2.destroyAllWindows()
     try:
         follower.disable_torque()
     except Exception:
